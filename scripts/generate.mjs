@@ -7,7 +7,7 @@ await syncLiveR2Config(true);
 
 const shard = Number(process.env.SHARD || '0');
 const shards = Number(process.env.SHARDS || '1');
-const parallel = Math.max(1, Math.min(12, Number(process.env.PARALLEL || '10')));
+const parallel = Math.max(1, Math.min(12, Number(process.env.PARALLEL || '6')));
 const batchId = (process.env.BATCH_ID || '').trim();
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
 
@@ -111,23 +111,23 @@ async function processOne(item) {
     const filter = `fps=${1 / grid.interval},scale=${grid.tileW}:${grid.tileH}:force_original_aspect_ratio=decrease,pad=${grid.tileW}:${grid.tileH}:(ow-iw)/2:(oh-ih)/2:color=black,tile=${grid.cols}x${grid.rows}`;
     const jpg = join(dir, `${name}.jpg`);
 
-    // Tentativa 1 (Turbo): descarta pacotes não-keyframe direto no demuxer MP4 (-discard nokey) + decode acelerado (máx 90s)
+    // Tentativa 1 (Turbo): descarta pacotes não-keyframe direto no demuxer MP4 (-discard nokey) + decode acelerado (máx 240s)
     try {
       await exec(
         'ffmpeg',
         [
           '-y', '-nostdin', '-loglevel', 'error',
           '-probesize', '500000', '-analyzeduration', '500000',
-          '-rw_timeout', '12000000',
+          '-rw_timeout', '15000000',
           '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '4',
           '-user_agent', UA, '-threads', '0', '-flags2', 'fast',
           '-skip_loop_filter', 'all', '-skip_idct', 'all',
           '-discard', 'nokey', '-skip_frame', 'nokey',
           '-i', url,
-          '-an', '-sn', '-dn', '-frames:v', '1',
+          '-an', '-sn', '-dn', '-frames:v', '1', '-update', '1',
           '-sws_flags', 'fast_bilinear', '-vf', filter, '-q:v', '6', jpg,
         ],
-        { timeoutMs: 90_000 },
+        { timeoutMs: 240_000 },
       );
     } catch (_) {}
 
@@ -144,10 +144,10 @@ async function processOne(item) {
           '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '4',
           '-user_agent', UA, '-threads', '0', '-flags2', 'fast',
           '-i', url,
-          '-an', '-sn', '-dn', '-frames:v', '1',
+          '-an', '-sn', '-dn', '-frames:v', '1', '-update', '1',
           '-sws_flags', 'fast_bilinear', '-vf', filter, '-q:v', '6', jpg,
         ],
-        { timeoutMs: 180_000 },
+        { timeoutMs: 300_000 },
       );
       jpgSize = statSync(jpg).size;
     }

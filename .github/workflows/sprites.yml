@@ -1,0 +1,117 @@
+name: sprites
+
+run-name: ${{ inputs.mode }} | ${{ inputs.batch_id || inputs.todo_key || format('limite {0}', inputs.limit) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: Quantos sprites gerar nesta rodada
+        default: '400'
+      offset:
+        description: Pular os N primeiros pendentes
+        default: '0'
+      mode:
+        description: sprites (jpg+vtt), credits ou intro
+        default: sprites
+        type: choice
+        options: [sprites, credits, intro]
+      kind:
+        description: movies, tv ou all
+        default: all
+        type: choice
+        options: [all, movies, tv]
+      dest_prefix:
+        description: Prefixo no R2
+        default: vtt-sprites/
+      chunks:
+        description: Jobs em paralelo (máx. 20)
+        default: '20'
+      parallel:
+        description: Itens em paralelo dentro de cada job
+        default: '3'
+      todo_key:
+        description: Chave no R2 da lista pronta da VPS
+        default: ''
+      batch_id:
+        description: ID do lote no painel CineVEO
+        default: ''
+      rounds:
+        description: Quantas rodadas encadeadas
+        default: '1'
+      then:
+        description: Modos seguintes
+        default: ''
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: cineveo-sprites-${{ inputs.mode }}-${{ inputs.batch_id || 'manual' }}
+  cancel-in-progress: true
+
+env:
+  R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+  R2_BUCKET: ${{ vars.R2_BUCKET }}
+  R2_PUBLIC_URL: ${{ vars.R2_PUBLIC_URL }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  CINEVEO_CALLBACK_URL: ${{ vars.CINEVEO_CALLBACK_URL }}
+  CINEVEO_CALLBACK_SECRET: ${{ secrets.CINEVEO_CALLBACK_SECRET }}
+  DEST_PREFIX: ${{ inputs.dest_prefix }}
+  BATCH_ID: ${{ inputs.batch_id }}
+  TODO_KEY: ${{ inputs.todo_key }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        run: node scripts/plan.mjs
+        env:
+          LIMIT: ${{ inputs.limit }}
+          OFFSET: ${{ inputs.offset }}
+          KIND: ${{ inputs.kind }}
+          MODE: ${{ inputs.mode }}
+          CHUNKS: ${{ inputs.chunks }}
+          TODO_KEY: ${{ inputs.todo_key }}
+          BATCH_ID: ${{ inputs.batch_id }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: todo
+          path: todo.json
+          retention-days: 1
+
+  generate:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: todo
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - run: node scripts/generate.mjs
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ strategy.job-total }}
+          PARALLEL: ${{ inputs.parallel || '3' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.shard }}
+          path: result-*.json
+          retention-days: 1
+          if-no-files-found: ignore

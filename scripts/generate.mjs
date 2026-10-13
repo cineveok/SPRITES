@@ -98,125 +98,159 @@ async function processOne(item) {
   }).catch(() => {});
 
   const started = Date.now();
-  const dir = mkdtempSync(join(tmpdir(), 'sprite-'));
-  try {
-    const bucket = env('R2_BUCKET');
-    const publicBase = (process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
-    if (!publicBase) throw new Error('R2_PUBLIC_URL ausente');
+  const MAX_RETRIES = 3;
+  let lastError = null;
 
-    const { url, duration } = await resolveAndProbeVideo(item, bucket);
-    const grid = layout(duration);
-    if (!grid) throw new Error('quadros insuficientes');
-
-    const filter = `fps=${1 / grid.interval},scale=${grid.tileW}:${grid.tileH}:force_original_aspect_ratio=decrease,pad=${grid.tileW}:${grid.tileH}:(ow-iw)/2:(oh-ih)/2:color=black,tile=${grid.cols}x${grid.rows}`;
-    const jpg = join(dir, `${name}.jpg`);
-
-    // Tentativa 1 (Turbo): descarta pacotes não-keyframe direto no demuxer MP4 (-discard nokey) + decode acelerado (máx 240s)
+  for (let retry = 0; retry <= MAX_RETRIES; retry++) {
+    if (shouldStop) return;
+    const dir = mkdtempSync(join(tmpdir(), 'sprite-'));
     try {
-      await exec(
-        'ffmpeg',
-        [
-          '-y', '-nostdin', '-loglevel', 'error',
-          '-probesize', '500000', '-analyzeduration', '500000',
-          '-rw_timeout', '15000000',
-          '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '4',
-          '-user_agent', UA, '-threads', '0', '-flags2', 'fast',
-          '-skip_loop_filter', 'all', '-skip_idct', 'all',
-          '-discard', 'nokey', '-skip_frame', 'nokey',
-          '-i', url,
-          '-an', '-sn', '-dn', '-frames:v', '1', '-update', '1',
-          '-sws_flags', 'fast_bilinear', '-vf', filter, '-q:v', '6', jpg,
-        ],
-        { timeoutMs: 240_000 },
-      );
-    } catch (_) {}
+      const bucket = env('R2_BUCKET');
+      const publicBase = (process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
+      if (!publicBase) throw new Error('R2_PUBLIC_URL ausente');
 
-    // Tentativa 2 (fallback se o vídeo tiver poucos keyframes e o jpg não gerou)
-    let jpgSize = 0;
-    try { jpgSize = statSync(jpg).size; } catch (_) { jpgSize = 0; }
-    if (jpgSize < 1000) {
-      await exec(
-        'ffmpeg',
-        [
-          '-y', '-nostdin', '-loglevel', 'error',
-          '-probesize', '500000', '-analyzeduration', '500000',
-          '-rw_timeout', '15000000',
-          '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '4',
-          '-user_agent', UA, '-threads', '0', '-flags2', 'fast',
-          '-i', url,
-          '-an', '-sn', '-dn', '-frames:v', '1', '-update', '1',
-          '-sws_flags', 'fast_bilinear', '-vf', filter, '-q:v', '6', jpg,
-        ],
-        { timeoutMs: 300_000 },
-      );
-      jpgSize = statSync(jpg).size;
+      const { url, duration } = await resolveAndProbeVideo(item, bucket);
+      const grid = layout(duration);
+      if (!grid) throw new Error('quadros insuficientes');
+
+      const filter = `fps=${1 / grid.interval},scale=${grid.tileW}:${grid.tileH}:force_original_aspect_ratio=decrease,pad=${grid.tileW}:${grid.tileH}:(ow-iw)/2:(oh-ih)/2:color=black,tile=${grid.cols}x${grid.rows}`;
+      const jpg = join(dir, `${name}.jpg`);
+
+      // Modo Turbo (-discard nokey) na primeira tentativa e retry 1
+      if (retry <= 1) {
+        try {
+          await exec(
+            'ffmpeg',
+            [
+              '-y', '-nostdin', '-loglevel', 'error',
+              '-probesize', '1000000', '-analyzeduration', '1000000',
+              '-rw_timeout', '20000000',
+              '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+              '-user_agent', UA, '-threads', '0', '-flags2', 'fast',
+              '-skip_loop_filter', 'all', '-skip_idct', 'all',
+              '-discard', 'nokey', '-skip_frame', 'nokey',
+              '-i', url,
+              '-an', '-sn', '-dn', '-frames:v', '1', '-update', '1',
+              '-sws_flags', 'fast_bilinear', '-vf', filter, '-q:v', '6', jpg,
+            ],
+            { timeoutMs: 240_000 },
+          );
+        } catch (_) {}
+      }
+
+      // Fallback completo (sem -discard nokey) se o jpg não gerou ou nas tentativas 2 e 3
+      let jpgSize = 0;
+      try { jpgSize = statSync(jpg).size; } catch (_) { jpgSize = 0; }
+      if (jpgSize < 1000) {
+        await exec(
+          'ffmpeg',
+          [
+            '-y', '-nostdin', '-loglevel', 'error',
+            '-probesize', '2000000', '-analyzeduration', '2000000',
+            '-rw_timeout', '25000000',
+            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+            '-user_agent', UA, '-threads', '0', '-flags2', 'fast',
+            '-i', url,
+            '-an', '-sn', '-dn', '-frames:v', '1', '-update', '1',
+            '-sws_flags', 'fast_bilinear', '-vf', filter, '-q:v', '6', jpg,
+          ],
+          { timeoutMs: 300_000 },
+        );
+        jpgSize = statSync(jpg).size;
+      }
+
+      if (jpgSize < 1000) throw new Error('jpg gerado vazio ou pequeno demais');
+
+      await syncLiveR2Config(false);
+      const targetBucket = env('R2_BUCKET');
+      const targetPublicBase = (process.env.R2_PUBLIC_URL || publicBase).replace(/\/+$/, '');
+
+      const spriteKey = `vtt-sprites/${name}.jpg`;
+      const vttKey = `vtt-files/${name}.vtt`;
+      const spritePublicUrl = `${targetPublicBase}/${spriteKey}`;
+      const vttPublicUrl = `${targetPublicBase}/${vttKey}`;
+
+      const vtt = join(dir, `${name}.vtt`);
+      writeFileSync(vtt, buildVtt(grid, duration, spritePublicUrl), 'utf8');
+
+      const cache = 'public, max-age=31536000, immutable';
+      await Promise.all([
+        aws(['s3', 'cp', jpg, `s3://${targetBucket}/${spriteKey}`, '--content-type', 'image/jpeg', '--cache-control', cache, '--only-show-errors']),
+        aws(['s3', 'cp', vtt, `s3://${targetBucket}/${vttKey}`, '--content-type', 'text/vtt; charset=utf-8', '--cache-control', cache, '--only-show-errors']),
+      ]);
+
+      const elapsedSec = Number(((Date.now() - started) / 1000).toFixed(1));
+      results.ok += 1;
+      console.log(`ok   ${name} (${grid.frames} quadros, ${Math.round(jpgSize / 1024)} KB) ${elapsedSec}s${retry > 0 ? ` [sucesso na tentativa ${retry}/${MAX_RETRIES}]` : ''}`);
+
+      await notifyCineveoPanel({
+        batch_id: batchId,
+        shard,
+        status: 'done',
+        name,
+        retry_count: retry,
+        item: {
+          kind: item.kind || (Number(item.season) > 0 ? 'episode' : 'movie'),
+          type: item.type || (Number(item.season) > 0 ? 'tv' : 'movie'),
+          tmdb_id: String(item.tmdb_id || ''),
+          season: Number(item.season || 0),
+          episode: Number(item.episode || 0),
+          title: String(item.title || name),
+        },
+        vtt_url: vttPublicUrl,
+        sprite_url: spritePublicUrl,
+        frames: grid.frames,
+        elapsed_sec: elapsedSec,
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      const cleanErr = scrub(error.message || 'Erro ao gerar sprite');
+      if (retry < MAX_RETRIES) {
+        const nextRetry = retry + 1;
+        console.log(`RETRY ${nextRetry}/${MAX_RETRIES} ${name}: ${cleanErr}`);
+        notifyCineveoPanel({
+          batch_id: batchId,
+          shard,
+          status: 'retry',
+          name,
+          retry_num: nextRetry,
+          max_retries: MAX_RETRIES,
+          error: cleanErr,
+          item: {
+            kind: item.kind || (Number(item.season) > 0 ? 'episode' : 'movie'),
+            type: item.type || (Number(item.season) > 0 ? 'tv' : 'movie'),
+            tmdb_id: String(item.tmdb_id || ''),
+            season: Number(item.season || 0),
+            episode: Number(item.episode || 0),
+            title: String(item.title || name),
+          },
+        }).catch(() => {});
+        await new Promise((r) => setTimeout(r, 3000 * nextRetry));
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
-
-    if (jpgSize < 1000) throw new Error('jpg gerado vazio ou pequeno demais');
-
-    await syncLiveR2Config(false);
-    const targetBucket = env('R2_BUCKET');
-    const targetPublicBase = (process.env.R2_PUBLIC_URL || publicBase).replace(/\/+$/, '');
-
-    const spriteKey = `vtt-sprites/${name}.jpg`;
-    const vttKey = `vtt-files/${name}.vtt`;
-    const spritePublicUrl = `${targetPublicBase}/${spriteKey}`;
-    const vttPublicUrl = `${targetPublicBase}/${vttKey}`;
-
-    const vtt = join(dir, `${name}.vtt`);
-    writeFileSync(vtt, buildVtt(grid, duration, spritePublicUrl), 'utf8');
-
-    const cache = 'public, max-age=31536000, immutable';
-    // Faz upload da imagem .jpg e do .vtt em paralelo no R2
-    await Promise.all([
-      aws(['s3', 'cp', jpg, `s3://${targetBucket}/${spriteKey}`, '--content-type', 'image/jpeg', '--cache-control', cache, '--only-show-errors']),
-      aws(['s3', 'cp', vtt, `s3://${targetBucket}/${vttKey}`, '--content-type', 'text/vtt; charset=utf-8', '--cache-control', cache, '--only-show-errors']),
-    ]);
-
-    const elapsedSec = Number(((Date.now() - started) / 1000).toFixed(1));
-    results.ok += 1;
-    console.log(`ok   ${name} (${grid.frames} quadros, ${Math.round(jpgSize / 1024)} KB) ${elapsedSec}s`);
-
-    await notifyCineveoPanel({
-      batch_id: batchId,
-      shard,
-      status: 'done',
-      name,
-      item: {
-        kind: item.kind || (Number(item.season) > 0 ? 'episode' : 'movie'),
-        type: item.type || (Number(item.season) > 0 ? 'tv' : 'movie'),
-        tmdb_id: String(item.tmdb_id || ''),
-        season: Number(item.season || 0),
-        episode: Number(item.episode || 0),
-        title: String(item.title || name),
-      },
-      vtt_url: vttPublicUrl,
-      sprite_url: spritePublicUrl,
-      frames: grid.frames,
-      elapsed_sec: elapsedSec,
-    });
-  } catch (error) {
-    results.failed += 1;
-    const cleanErr = scrub(error.message || 'Erro ao gerar sprite');
-    console.log(`FAIL ${name}: ${cleanErr}`);
-    await notifyCineveoPanel({
-      batch_id: batchId,
-      shard,
-      status: 'error',
-      name,
-      item: {
-        kind: item.kind || (Number(item.season) > 0 ? 'episode' : 'movie'),
-        type: item.type || (Number(item.season) > 0 ? 'tv' : 'movie'),
-        tmdb_id: String(item.tmdb_id || ''),
-        season: Number(item.season || 0),
-        episode: Number(item.episode || 0),
-        title: String(item.title || name),
-      },
-      error: cleanErr,
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
   }
+
+  results.failed += 1;
+  const finalErr = scrub((lastError && lastError.message) || 'Erro ao gerar sprite');
+  console.log(`SKIP ${name} (após ${MAX_RETRIES} novas tentativas): ${finalErr}`);
+  await notifyCineveoPanel({
+    batch_id: batchId,
+    shard,
+    status: 'skipped',
+    name,
+    item: {
+      kind: item.kind || (Number(item.season) > 0 ? 'episode' : 'movie'),
+      type: item.type || (Number(item.season) > 0 ? 'tv' : 'movie'),
+      tmdb_id: String(item.tmdb_id || ''),
+      season: Number(item.season || 0),
+      episode: Number(item.episode || 0),
+      title: String(item.title || name),
+    },
+    error: `Falhou após 3 tentativas (${finalErr}) — pulado`,
+  });
 }
 
 const localBuffer = [];

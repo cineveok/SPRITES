@@ -1,7 +1,7 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { aws, env, syncLiveR2Config } from './lib.mjs';
 
-await syncLiveR2Config();
+await syncLiveR2Config(true);
 
 const chunks = Math.max(1, Math.min(20, Number(process.env.CHUNKS || '20')));
 const batchId = (process.env.BATCH_ID || '').trim();
@@ -18,7 +18,7 @@ if (batchId && cbUrl && cbSecret) {
     const res = await fetch(`${cbUrl}${sep}action=runner_todo&batch_id=${encodeURIComponent(batchId)}`, {
       headers: {
         'X-Vtt-Secret': cbSecret,
-        'User-Agent': 'CineVEO-SpriteRunner/2.0',
+        'User-Agent': 'CineVEO-SpriteRunner/2.1',
       },
       signal: AbortSignal.timeout(30000),
     });

@@ -29,7 +29,7 @@ on:
         default: '20'
       parallel:
         description: Itens em paralelo dentro de cada job
-        default: '3'
+        default: '8'
       todo_key:
         description: Chave no R2 da lista pronta da VPS
         default: ''
@@ -102,12 +102,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: todo
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - run: command -v ffmpeg >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
       - run: node scripts/generate.mjs
         env:
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ strategy.job-total }}
-          PARALLEL: ${{ inputs.parallel || '3' }}
+          PARALLEL: ${{ inputs.parallel || '8' }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

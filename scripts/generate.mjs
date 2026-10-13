@@ -7,7 +7,7 @@ await syncLiveR2Config(true);
 
 const shard = Number(process.env.SHARD || '0');
 const shards = Number(process.env.SHARDS || '1');
-const parallel = Math.max(1, Math.min(12, Number(process.env.PARALLEL || '6')));
+const parallel = Math.max(1, Math.min(4, Number(process.env.PARALLEL || '4')));
 const batchId = (process.env.BATCH_ID || '').trim();
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
 
@@ -15,6 +15,8 @@ const all = JSON.parse(readFileSync('todo.json', 'utf8'));
 const fallbackQueue = all.filter((_, index) => index % shards === shard);
 const results = { ok: 0, failed: 0 };
 let shouldStop = false;
+process.on('SIGTERM', () => { shouldStop = true; });
+process.on('SIGINT', () => { shouldStop = true; });
 
 async function probeUrlDuration(url) {
   const out = await exec(
@@ -116,47 +118,45 @@ async function processOne(item) {
       const filter = `fps=${1 / grid.interval},scale=${grid.tileW}:${grid.tileH}:force_original_aspect_ratio=decrease,pad=${grid.tileW}:${grid.tileH}:(ow-iw)/2:(oh-ih)/2:color=black,tile=${grid.cols}x${grid.rows}`;
       const jpg = join(dir, `${name}.jpg`);
 
-      // Modo Turbo (-discard nokey) na primeira tentativa e retry 1
-      if (retry <= 1) {
-        try {
-          await exec(
-            'ffmpeg',
-            [
-              '-y', '-nostdin', '-loglevel', 'error',
-              '-probesize', '1000000', '-analyzeduration', '1000000',
-              '-rw_timeout', '20000000',
-              '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-              '-user_agent', UA, '-threads', '0', '-flags2', 'fast',
-              '-skip_loop_filter', 'all', '-skip_idct', 'all',
-              '-discard', 'nokey', '-skip_frame', 'nokey',
-              '-i', url,
-              '-an', '-sn', '-dn', '-frames:v', '1', '-update', '1',
-              '-sws_flags', 'fast_bilinear', '-vf', filter, '-q:v', '6', jpg,
-            ],
-            { timeoutMs: 240_000 },
-          );
-        } catch (_) {}
-      }
+      // Modo Turbo (-discard nokey) com timeout amplo de 420s para filmes grandes sem gargalar CPU
+      const probeBytes = retry === 0 ? '1500000' : '4000000';
+      await exec(
+        'ffmpeg',
+        [
+          '-y', '-nostdin', '-loglevel', 'error',
+          '-probesize', probeBytes, '-analyzeduration', probeBytes,
+          '-rw_timeout', '30000000',
+          '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+          '-user_agent', UA, '-threads', '2', '-flags2', 'fast',
+          '-skip_loop_filter', 'all', '-skip_idct', 'all',
+          '-discard', 'nokey', '-skip_frame', 'nokey',
+          '-i', url,
+          '-an', '-sn', '-dn', '-frames:v', '1', '-update', '1',
+          '-sws_flags', 'fast_bilinear', '-vf', filter, '-q:v', '6', jpg,
+        ],
+        { timeoutMs: 420_000 },
+      );
 
-      // Fallback completo (sem -discard nokey) se o jpg não gerou ou nas tentativas 2 e 3
       let jpgSize = 0;
       try { jpgSize = statSync(jpg).size; } catch (_) { jpgSize = 0; }
-      if (jpgSize < 1000) {
+
+      // Fallback sem nokey apenas para vídeos curtos (<5 min) que tenham poucos keyframes
+      if (jpgSize < 1000 && duration < 300) {
         await exec(
           'ffmpeg',
           [
             '-y', '-nostdin', '-loglevel', 'error',
-            '-probesize', '2000000', '-analyzeduration', '2000000',
+            '-probesize', '3000000', '-analyzeduration', '3000000',
             '-rw_timeout', '25000000',
             '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-            '-user_agent', UA, '-threads', '0', '-flags2', 'fast',
+            '-user_agent', UA, '-threads', '2', '-flags2', 'fast',
             '-i', url,
             '-an', '-sn', '-dn', '-frames:v', '1', '-update', '1',
             '-sws_flags', 'fast_bilinear', '-vf', filter, '-q:v', '6', jpg,
           ],
-          { timeoutMs: 300_000 },
+          { timeoutMs: 240_000 },
         );
-        jpgSize = statSync(jpg).size;
+        try { jpgSize = statSync(jpg).size; } catch (_) { jpgSize = 0; }
       }
 
       if (jpgSize < 1000) throw new Error('jpg gerado vazio ou pequeno demais');
@@ -204,6 +204,7 @@ async function processOne(item) {
       });
       return;
     } catch (error) {
+      if (shouldStop) return;
       lastError = error;
       const cleanErr = scrub(error.message || 'Erro ao gerar sprite');
       if (retry < MAX_RETRIES) {
